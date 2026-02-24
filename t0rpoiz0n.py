@@ -127,7 +127,7 @@ def check_deps() -> bool:
 
 def default_interface() -> Optional[str]:
     for cmd in (
-        "ip route | grep default | awk '{print $5}'",
+        "ip route | grep default | awk '{print $5}' | head -1",
         "ip link show | grep -v 'lo:' | grep 'state UP' | awk '{print $2}' | tr -d ':' | head -1",
     ):
         r = run(cmd, check=False)
@@ -157,17 +157,16 @@ def change_mac(interface: str, vendor: Optional[str] = None) -> bool:
 
 # ── iptables rules ────────────────────────────────────────────────────────────
 
+# NAT table: only REDIRECT and RETURN are valid targets here.
+# Port blocking (REJECT) must live in *filter, not *nat.
 _RULES_NAT = """\
 *nat
 :PREROUTING  ACCEPT [0:0]
 :INPUT       ACCEPT [0:0]
 :OUTPUT      ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
--A OUTPUT -p udp --dport 53  -j REDIRECT --to-ports 53
--A OUTPUT -p tcp --dport 53  -j REDIRECT --to-ports 53
--A OUTPUT -p tcp --dport 853 -j REJECT
--A OUTPUT -p udp --dport 853 -j REJECT
--A OUTPUT -p udp --dport 443 -j REJECT
+-A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53
+-A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports 53
 -A OUTPUT -m owner --uid-owner tor -j RETURN
 -A OUTPUT -d 127.0.0.0/8    -j RETURN
 -A OUTPUT -d 192.168.0.0/16 -j RETURN
@@ -177,7 +176,7 @@ _RULES_NAT = """\
 COMMIT
 """
 
-# nft backend: ipv6-icmp handled via native nft; no owner match needed in filter
+# nft backend: ipv6-icmp handled via native nft commands; no owner match in filter
 _FILTER_NFT = """\
 *filter
 :INPUT   ACCEPT [0:0]
@@ -187,6 +186,9 @@ _FILTER_NFT = """\
 -A OUTPUT -o lo -j ACCEPT
 -A INPUT  -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+-A OUTPUT -p tcp --dport 853 -j REJECT
+-A OUTPUT -p udp --dport 853 -j REJECT
+-A OUTPUT -p udp --dport 443 -j REJECT
 -A OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT
 -A OUTPUT -p tcp --dport 53 -d 127.0.0.1 -j ACCEPT
 -A OUTPUT -p tcp --dport 9040 -j ACCEPT
@@ -209,6 +211,9 @@ _FILTER_LEGACY = """\
 -A INPUT  -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A OUTPUT -m owner --uid-owner tor -j ACCEPT
+-A OUTPUT -p tcp --dport 853 -j REJECT
+-A OUTPUT -p udp --dport 853 -j REJECT
+-A OUTPUT -p udp --dport 443 -j REJECT
 -A OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT
 -A OUTPUT -p tcp --dport 53 -d 127.0.0.1 -j ACCEPT
 -A OUTPUT -p tcp --dport 9040 -j ACCEPT

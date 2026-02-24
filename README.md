@@ -139,7 +139,7 @@ sudo t0rpoiz0n --setup
 
 **No internet after starting**
 
-```bash
+- 
 sudo t0rpoiz0n -c     # check status
 sudo t0rpoiz0n -r     # try a new circuit
 sudo t0rpoiz0n -k && sudo t0rpoiz0n -s   # full restart
@@ -170,17 +170,20 @@ curl https://check.torproject.org/api/ip
 ---
 
 ## Changelog
-### v1.2.0
-updates:
-
-Tier 1 — Kernel & firewall hardening (harden_sysctl())
+### v1.2.0 ADDED 3 tiers! :
+```bash
+- Tier 1 — Kernel & firewall hardening (harden_sysctl())
+  
 13 sysctl parameters applied on start, saved to sysctl.json, fully restored on stop: TCP timestamps off, ICMP redirects disabled, source routing disabled, echo ignore, broadcast ping ignore, full ASLR, reverse path filtering, martian packet logging. INPUT and FORWARD chains now default to DROP — only loopback and ESTABLISHED/RELATED inbound are allowed. Outbound ICMP blocked (OS fingerprint surface). NTP blocked outbound (timing correlation). Clearnet leak window closed by setting OUTPUT DROP before flushing rules, so there's no open moment between flush and reapply.
-Tier 2 — System-level anonymisation
+  
+- Tier 2 — System-level anonymisation
 harden_hostname() — replaces hostname with ghost-4821 style random token on start, restores on stop. Prevents mDNS/DHCP leaks. harden_timezone() — switches to UTC on start, restores original on stop. harden_swap() — swapoff -a on start so keys/decrypted data can't be paged to disk, swapon -a on stop. Clock sync — chronyc makestep (or ntpdate fallback) runs before the firewall seals so NTP never escapes through the Tor session. Bridge support — -b flag accepts an obfs4 bridge line, written into torrc with UseBridges 1 + ClientTransportPlugin obfs4.
-Tier 3 — Tor-level hardening
+
+- Tier 3 — Tor-level hardening
 Stream isolation — both SocksPort and TransPort now carry IsolateSOCKSAuth IsolateDestAddr IsolateDestPort (plus IsolateClientAddr IsolateClientProtocol on TransPort), so each destination gets a separate circuit. Guard pinning — -g FINGERPRINT writes EntryNodes + StrictNodes 1 into torrc, eliminating guard rotation as an attack surface.
 --no-harden flag — skips all of the above for debugging without reverting.
 -c status output now shows hostname, timezone, swap state, TCP timestamps, and INPUT policy so you can verify hardening is active at a glance.
+  ```
 
 ### v1.1.3
 

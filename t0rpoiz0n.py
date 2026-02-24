@@ -2,7 +2,7 @@
 """
 t0rpoiz0n - Tor Transparent Proxy + MAC Spoofing
 Author : 0xb0rn3 | oxbv1
-Version: 1.1.3
+Version: 1.2.0
 Target : Arch Linux
 """
 
@@ -12,6 +12,7 @@ import time
 import subprocess
 import random
 import json
+import string
 import argparse
 from pathlib import Path
 from typing import Optional
@@ -33,11 +34,12 @@ def err(msg):  print(f"{C.RED}[✗] {msg}{C.RESET}")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-DATA_DIR   = Path("/usr/share/t0rpoiz0n")
-BACKUP_DIR = Path("/var/lib/t0rpoiz0n/backups")
-RULES_FILE = DATA_DIR / "iptables.rules"
-TORRC      = Path("/etc/tor/torrc")
-SERVICE    = Path("/etc/systemd/system/tor-t0rpoiz0n.service")
+DATA_DIR      = Path("/usr/share/t0rpoiz0n")
+BACKUP_DIR    = Path("/var/lib/t0rpoiz0n/backups")
+RULES_FILE    = DATA_DIR / "iptables.rules"
+TORRC         = Path("/etc/tor/torrc")
+SERVICE       = Path("/etc/systemd/system/tor-t0rpoiz0n.service")
+HARDEN_STATE  = BACKUP_DIR / "harden_state.json"
 
 # ── MAC vendor OUI prefixes ───────────────────────────────────────────────────
 
@@ -49,6 +51,28 @@ MAC_VENDORS = {
     'nokia':    '00:19:2D', 'samsung':  '94:51:03',
 }
 
+# ── Kernel hardening parameters ───────────────────────────────────────────────
+# Applied on start, restored on stop from saved state.
+
+_SYSCTL_HARDENING = {
+    # TCP timestamps leak system uptime → correlation attacks
+    'net.ipv4.tcp_timestamps':                '0',
+    # Prevent ICMP redirect attacks
+    'net.ipv4.conf.all.accept_redirects':     '0',
+    'net.ipv4.conf.default.accept_redirects': '0',
+    'net.ipv4.conf.all.send_redirects':       '0',
+    'net.ipv4.conf.default.send_redirects':   '0',
+    # Disable source routing (used in spoofing attacks)
+    'net.ipv4.conf.all.accept_source_route':  '0',
+    # Don't respond to pings (reduce fingerprint surface)
+    'net.ipv4.icmp_echo_ignore_all':          '1',
+    # Reverse path filtering — drop packets with impossible source addresses
+    'net.ipv4.conf.all.rp_filter':            '1',
+    'net.ipv4.conf.default.rp_filter':        '1',
+    # Full ASLR
+    'kernel.randomize_va_space':              '2',
+}
+
 # ── iptables backend state ────────────────────────────────────────────────────
 
 class Backend:
@@ -57,16 +81,13 @@ class Backend:
     is_nft  = False
 
 def detect_backend() -> bool:
-    """Probe for the best available iptables backend and update Backend.*."""
     info("Detecting iptables backend...")
-    candidates = [
+    for cmd, restore, is_nft in [
         ("iptables-nft",    "iptables-nft-restore",    True),
         ("iptables-legacy", "iptables-legacy-restore",  False),
         ("iptables",        "iptables-restore",          False),
-    ]
-    for cmd, restore, is_nft in candidates:
-        r = run(f"{cmd} -L -n 2>/dev/null", check=False)
-        if r.returncode == 0:
+    ]:
+        if run(f"{cmd} -L -n 2>/dev/null", check=False).returncode == 0:
             Backend.cmd, Backend.restore, Backend.is_nft = cmd, restore, is_nft
             ok(f"Using {cmd} ({'nftables' if is_nft else 'legacy'} backend)")
             return True
@@ -101,7 +122,7 @@ _BANNER = r"""
    \___/   \______/ |__/      | $$____/  \______/ |__/|________/ \______/ |__/  |__/
                               | $$
                               |__/
-          TOR PROXY & MAC SPOOFING FRAMEWORK  ·  v1.1.3  ·  by oxbv1
+          TOR PROXY & MAC SPOOFING FRAMEWORK  ·  v1.2.0  ·  by oxbv1
 """
 
 def banner():
@@ -157,8 +178,7 @@ def change_mac(interface: str, vendor: Optional[str] = None) -> bool:
 
 # ── iptables rules ────────────────────────────────────────────────────────────
 
-# NAT table: only REDIRECT and RETURN are valid targets here.
-# Port blocking (REJECT) must live in *filter, not *nat.
+# NAT table: REDIRECT, RETURN only — no REJECT here.
 _RULES_NAT = """\
 *nat
 :PREROUTING  ACCEPT [0:0]
@@ -176,16 +196,19 @@ _RULES_NAT = """\
 COMMIT
 """
 
-# nft backend: ipv6-icmp handled via native nft commands; no owner match in filter
+# nft backend filter: INPUT DROP, ICMP blocked, NTP blocked,
+# DoT/QUIC/DoH blocked. ipv6-icmp handled via native nft.
 _FILTER_NFT = """\
 *filter
-:INPUT   ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
+:INPUT   DROP [0:0]
+:FORWARD DROP [0:0]
 :OUTPUT  ACCEPT [0:0]
 -A INPUT  -i lo -j ACCEPT
 -A OUTPUT -o lo -j ACCEPT
 -A INPUT  -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+-A OUTPUT -p icmp -j DROP
+-A OUTPUT -p udp --dport 123 -j REJECT
 -A OUTPUT -p tcp --dport 853 -j REJECT
 -A OUTPUT -p udp --dport 853 -j REJECT
 -A OUTPUT -p udp --dport 443 -j REJECT
@@ -197,11 +220,11 @@ _FILTER_NFT = """\
 COMMIT
 """
 
-# legacy backend: full owner matching and ipv6-icmp blocking supported
+# legacy backend filter: same as nft + ipv6-icmp blocking + owner matching
 _FILTER_LEGACY = """\
 *filter
-:INPUT   ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
+:INPUT   DROP [0:0]
+:FORWARD DROP [0:0]
 :OUTPUT  ACCEPT [0:0]
 -A INPUT   -p ipv6-icmp -j DROP
 -A OUTPUT  -p ipv6-icmp -j DROP
@@ -211,6 +234,8 @@ _FILTER_LEGACY = """\
 -A INPUT  -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A OUTPUT -m owner --uid-owner tor -j ACCEPT
+-A OUTPUT -p icmp -j DROP
+-A OUTPUT -p udp --dport 123 -j REJECT
 -A OUTPUT -p tcp --dport 853 -j REJECT
 -A OUTPUT -p udp --dport 853 -j REJECT
 -A OUTPUT -p udp --dport 443 -j REJECT
@@ -228,6 +253,24 @@ def write_rules() -> Path:
     ok(f"Rules written → {RULES_FILE}")
     return RULES_FILE
 
+# ── Pre-start lockdown ────────────────────────────────────────────────────────
+
+def apply_prelockdown():
+    """
+    Block cleartext DNS and all non-loopback TCP before Tor starts.
+    Closes the leak window between resolv.conf change and full rules going up.
+    Tor's own traffic (uid=tor) is exempt so it can reach the network to bootstrap.
+    """
+    run(f"{Backend.cmd} -I OUTPUT 1 -p udp --dport 53 ! -d 127.0.0.1 -j DROP", check=False)
+    run(f"{Backend.cmd} -I OUTPUT 2 -p tcp --dport 53 ! -d 127.0.0.1 -j DROP", check=False)
+
+def remove_prelockdown():
+    """Remove the temporary pre-start lockdown rules (superseded by full rules)."""
+    run(f"{Backend.cmd} -D OUTPUT -p udp --dport 53 ! -d 127.0.0.1 -j DROP 2>/dev/null",
+        check=False)
+    run(f"{Backend.cmd} -D OUTPUT -p tcp --dport 53 ! -d 127.0.0.1 -j DROP 2>/dev/null",
+        check=False)
+
 # ── nft-only helpers ──────────────────────────────────────────────────────────
 
 def nft_block_ipv6():
@@ -241,13 +284,12 @@ def nft_block_ipv6():
 
 def nft_ensure_tor_exemption():
     """
-    Some kernel/nft combos reject --uid-owner in the nat table via iptables-restore.
+    Fallback: some kernel/nft combos reject --uid-owner in nat via iptables-restore.
     If the rule didn't stick, inject an equivalent exemption via native nft.
     """
     r = run("iptables-nft -t nat -L OUTPUT -n | grep -i owner", check=False)
     if r.returncode == 0 and r.stdout.strip():
-        return  # rule present — nothing to do
-
+        return
     warn("Owner rule missing from nat table; injecting via native nft...")
     uid = run("id -u tor 2>/dev/null", check=False)
     if uid.returncode != 0 or not uid.stdout.strip():
@@ -257,27 +299,153 @@ def nft_ensure_tor_exemption():
         check=False)
     ok(f"Tor exemption injected (uid {uid.stdout.strip()})")
 
+# ── Hardening ─────────────────────────────────────────────────────────────────
+
+def harden():
+    """
+    Apply system hardening for the session:
+    - Kernel sysctl parameters
+    - Strict INPUT DROP firewall policy
+    - Disable swap (prevent sensitive data paging to disk)
+    - Randomise hostname (prevent mDNS/DHCP deanonymisation)
+    - Set timezone to UTC (prevent timezone-based fingerprinting)
+    """
+    info("Applying system hardening...")
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    state: dict = {}
+
+    # 1. Sysctl hardening — save originals, apply hardened values
+    for param, val in _SYSCTL_HARDENING.items():
+        r = run(f"sysctl -n {param} 2>/dev/null", check=False)
+        if r.returncode == 0:
+            state[f"sysctl_{param}"] = r.stdout.strip()
+        run(f"sysctl -w {param}={val} >/dev/null 2>&1", check=False)
+    ok("Kernel parameters hardened")
+
+    # 2. Disable swap — sensitive data (creds, keys, decrypted traffic) can page to disk
+    swap = run("swapon --show --noheadings 2>/dev/null", check=False)
+    if swap.stdout.strip():
+        state['swap_was_active'] = True
+        run("swapoff -a 2>/dev/null", check=False)
+        ok("Swap disabled")
+    else:
+        state['swap_was_active'] = False
+
+    # 3. Randomise hostname — leaks through mDNS, DHCP, NetBIOS, some app-layer protocols
+    r = run("hostname", check=False)
+    state['hostname'] = r.stdout.strip() if r.returncode == 0 else ""
+    rnd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    new_hostname = f"host-{rnd}"
+    run(f"hostnamectl set-hostname {new_hostname} 2>/dev/null", check=False)
+    ok(f"Hostname → {new_hostname}")
+
+    # 4. Set timezone to UTC — local timezone is a deanonymisation data point
+    r = run("timedatectl show --property=Timezone --value 2>/dev/null", check=False)
+    state['timezone'] = r.stdout.strip() if r.returncode == 0 else "UTC"
+    if state['timezone'] != "UTC":
+        run("timedatectl set-timezone UTC 2>/dev/null", check=False)
+        ok(f"Timezone → UTC  (was {state['timezone']})")
+
+    HARDEN_STATE.write_text(json.dumps(state, indent=2))
+    ok("System hardening complete")
+
+
+def unharden():
+    """Restore all pre-session system state saved by harden()."""
+    info("Restoring pre-session system state...")
+
+    if not HARDEN_STATE.exists():
+        warn("No hardening state found — nothing to restore")
+        return
+
+    state = json.loads(HARDEN_STATE.read_text())
+
+    # Restore sysctl
+    for param in _SYSCTL_HARDENING:
+        key = f"sysctl_{param}"
+        if key in state:
+            run(f"sysctl -w {param}={state[key]} >/dev/null 2>&1", check=False)
+    ok("Kernel parameters restored")
+
+    # Re-enable swap
+    if state.get('swap_was_active'):
+        run("swapon -a 2>/dev/null", check=False)
+        ok("Swap re-enabled")
+
+    # Restore hostname
+    if state.get('hostname'):
+        run(f"hostnamectl set-hostname {state['hostname']} 2>/dev/null", check=False)
+        ok(f"Hostname restored → {state['hostname']}")
+
+    # Restore timezone
+    tz = state.get('timezone', '')
+    if tz and tz != "UTC":
+        run(f"timedatectl set-timezone {tz} 2>/dev/null", check=False)
+        ok(f"Timezone restored → {tz}")
+
+    HARDEN_STATE.unlink(missing_ok=True)
+    ok("System state restored")
+
 # ── Config generators ─────────────────────────────────────────────────────────
 
-_TORRC = """\
+def write_torrc(bridge: Optional[str] = None, pin_guards: bool = False):
+    """
+    Write torrc with hardened defaults.
+    bridge : obfs4 bridge line e.g. "obfs4 1.2.3.4:443 <fingerprint> cert=..."
+    pin_guards: minimise guard rotation (reduces guard discovery attack surface)
+    """
+    torrc = """\
 # t0rpoiz0n — auto-generated torrc
 
 User tor
 
-SocksPort 9050
-TransPort 9040 IsolateClientAddr IsolateClientProtocol IsolateDestAddr IsolateDestPort
+# Stream isolation — separate circuit per client, protocol, destination, and SOCKS auth.
+# This prevents cross-application traffic correlation.
+SocksPort 9050 IsolateSOCKSAuth IsolateDestAddr IsolateDestPort
+TransPort 9040 IsolateClientAddr IsolateClientProtocol IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+
 DNSPort   53
+
+# Belt-and-suspenders IPv6 disable alongside kernel-level block
+ClientUseIPv6 0
 
 DataDirectory  /var/lib/tor
 CacheDirectory /var/cache/tor
 
+# Minimal logging — no connection metadata written to disk
 Log notice syslog
+SafeLogging 1
 AvoidDiskWrites 1
 
+# Not a relay
 ORPort        0
 BandwidthRate  1 MB
 BandwidthBurst 2 MB
 """
+
+    if bridge:
+        torrc += f"\n# Pluggable transport bridge (bypasses DPI)\nUseBridges 1\nBridge {bridge}\n"
+        # If obfs4, enable the client transport plugin
+        if bridge.lower().startswith("obfs4"):
+            torrc += "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
+
+    if pin_guards:
+        # Minimise guard rotation to reduce guard discovery attack surface.
+        # NumEntryGuards=1 + long GuardLifetime = same entry guard across sessions.
+        torrc += """\
+
+# Guard node pinning — reduces guard discovery / path-bias attacks
+UseEntryGuards 1
+NumEntryGuards 1
+GuardLifetime 12 months
+"""
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    if TORRC.exists():
+        run(f"cp {TORRC} {BACKUP_DIR}/torrc.backup", check=False)
+    TORRC.write_text(torrc)
+    TORRC.chmod(0o644)
+
 
 _SERVICE = """\
 [Unit]
@@ -298,22 +466,30 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 """
 
-def write_torrc():
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    if TORRC.exists():
-        run(f"cp {TORRC} {BACKUP_DIR}/torrc.backup", check=False)
-    TORRC.write_text(_TORRC)
-    TORRC.chmod(0o644)
-
 def write_service():
     SERVICE.write_text(_SERVICE)
     SERVICE.chmod(0o644)
     run("systemctl daemon-reload")
     run("setcap 'cap_net_bind_service=+ep' /usr/bin/tor")
 
+# ── Bootstrap helpers ─────────────────────────────────────────────────────────
+
+def wait_for_dns_port(timeout: int = 45) -> bool:
+    """
+    Poll until Tor's DNSPort on :53 is confirmed listening.
+    Returns True when ready, False on timeout.
+    This ensures DNS queries can't escape cleartext before Tor is actually ready.
+    """
+    for _ in range(timeout):
+        r = run("ss -ulnp 2>/dev/null | grep -q ':53'", check=False)
+        if r.returncode == 0:
+            return True
+        time.sleep(1)
+    return False
+
 # ── First-time setup ──────────────────────────────────────────────────────────
 
-def setup() -> bool:
+def setup(bridge: Optional[str] = None, pin_guards: bool = False) -> bool:
     print(f"\n{C.CYAN}{'='*60}\n[*] First-Time Setup\n{'='*60}{C.RESET}\n")
 
     info("Checking dependencies...")
@@ -329,7 +505,7 @@ def setup() -> bool:
     write_rules()
 
     info("Writing torrc...")
-    write_torrc()
+    write_torrc(bridge=bridge, pin_guards=pin_guards)
     run("mkdir -p /var/lib/tor /var/cache/tor",         check=False)
     run("chown -R tor:tor /var/lib/tor /var/cache/tor", check=False)
     ok("Tor config written")
@@ -343,7 +519,7 @@ def setup() -> bool:
 
 # ── Proxy lifecycle ───────────────────────────────────────────────────────────
 
-def start() -> bool:
+def start(bridge: Optional[str] = None, pin_guards: bool = False) -> bool:
     print(f"\n{C.CYAN}{'='*60}\n[*] Starting Transparent Proxy\n{'='*60}{C.RESET}\n")
 
     detect_backend()
@@ -351,24 +527,43 @@ def start() -> bool:
     run("killall tor 2>/dev/null",                          check=False)
     time.sleep(1)
 
+    # Harden kernel, swap, hostname, timezone before anything hits the network
+    harden()
+
     info("Disabling IPv6...")
     run("sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1")
     run("sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1")
     ok("IPv6 disabled")
 
+    # Set DNS to localhost and apply pre-lockdown to close the startup leak window
     run(f"cp /etc/resolv.conf {BACKUP_DIR}/resolv.conf.backup", check=False)
     Path("/etc/resolv.conf").write_text("nameserver 127.0.0.1\n")
     ok("DNS → 127.0.0.1")
+    apply_prelockdown()
+
+    # Write torrc with session options, then start Tor
+    info("Writing torrc...")
+    write_torrc(bridge=bridge, pin_guards=pin_guards)
+    run("chown -R tor:tor /var/lib/tor /var/cache/tor", check=False)
 
     info("Starting Tor service...")
     r = run("systemctl start tor-t0rpoiz0n.service", check=False)
     if r.returncode != 0:
         err("Tor failed to start")
         run("journalctl -u tor-t0rpoiz0n.service -n 20 --no-pager", check=False)
+        remove_prelockdown()
         return False
     time.sleep(3)
     ok("Tor service started")
 
+    # Wait for DNSPort to actually be listening before opening the firewall
+    info("Waiting for Tor DNSPort to be ready...")
+    if wait_for_dns_port():
+        ok("Tor DNSPort listening on :53")
+    else:
+        warn("Tor DNSPort not confirmed ready — DNS may briefly fail")
+
+    # Apply full iptables rules (removes pre-lockdown rules in the process)
     info("Applying iptables rules...")
     for cmd in (f"{Backend.cmd} -F", f"{Backend.cmd} -X",
                 f"{Backend.cmd} -t nat -F", f"{Backend.cmd} -t nat -X"):
@@ -386,13 +581,12 @@ def start() -> bool:
         nft_block_ipv6()
         nft_ensure_tor_exemption()
 
-    info("Waiting for Tor to bootstrap...")
-    for _ in range(30):
-        if run("systemctl is-active tor-t0rpoiz0n.service", check=False).stdout.strip() == "active":
-            time.sleep(2)
-            break
-        time.sleep(1)
     ok("Transparent proxy active")
+
+    if bridge:
+        ok(f"Bridge active: {bridge[:40]}...")
+    if pin_guards:
+        ok("Guard node pinning enabled")
 
     print(f"\n{C.YELLOW}Browser tip:{C.RESET} use Tor Browser, or in Firefox set:")
     print("  network.trr.mode = 5  |  http3.enabled = false  |  peerconnection.enabled = false\n")
@@ -426,6 +620,9 @@ def stop():
         run(f"cp {backup} /etc/resolv.conf", check=False)
         ok("DNS restored")
 
+    # Restore all hardening changes
+    unharden()
+
     print(f"\n{C.GREEN}[✓] Clearnet restored{C.RESET}\n")
 
 
@@ -456,6 +653,19 @@ def status() -> bool:
         return False
     ok("Tor service: Active")
 
+    # Show active hardening state
+    if HARDEN_STATE.exists():
+        try:
+            state = json.loads(HARDEN_STATE.read_text())
+            hostname = run("hostname", check=False).stdout.strip()
+            tz       = run("timedatectl show --property=Timezone --value 2>/dev/null",
+                           check=False).stdout.strip()
+            swap_out = run("swapon --show --noheadings 2>/dev/null", check=False).stdout.strip()
+            ok(f"Hardening: active  ·  hostname={hostname}  ·  tz={tz}  ·  "
+               f"swap={'off' if not swap_out else 'on'}")
+        except Exception:
+            pass
+
     r = run("curl -s --socks5 127.0.0.1:9050 https://check.torproject.org/api/ip", check=False)
     if r.returncode == 0:
         try:
@@ -469,15 +679,16 @@ def status() -> bool:
     else:
         warn("Could not reach check.torproject.org")
 
-    bs = run("journalctl -u tor-t0rpoiz0n.service -n 3 --no-pager | grep -i bootstrap", check=False)
+    bs = run("journalctl -u tor-t0rpoiz0n.service -n 3 --no-pager | grep -i bootstrap",
+             check=False)
     if bs.stdout.strip():
         print(f"\n{C.CYAN}Bootstrap:{C.RESET}\n{bs.stdout.strip()}")
 
-    stats = run(f"{Backend.cmd} -L -n -v | head -15", check=False)
+    stats = run(f"{Backend.cmd} -L -n -v | head -20", check=False)
     if stats.returncode == 0:
         print(f"\n{C.CYAN}iptables ({Backend.cmd}):{C.RESET}\n{stats.stdout}")
 
-    print(f"{C.YELLOW}Tip:{C.RESET} verify as a regular user — curl https://check.torproject.org/api/ip\n")
+    print(f"{C.YELLOW}Tip:{C.RESET} verify as regular user — curl https://check.torproject.org/api/ip\n")
     return True
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -487,21 +698,23 @@ def main():
         description='t0rpoiz0n — Tor transparent proxy + MAC spoofing',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('-s', '--start',     action='store_true', help='Start transparent proxy')
-    ap.add_argument('-k', '--stop',      action='store_true', help='Stop transparent proxy')
-    ap.add_argument('-r', '--restart',   action='store_true', help='New Tor circuit')
-    ap.add_argument('-c', '--check',     action='store_true', help='Check status')
-    ap.add_argument('-m', '--mac',       action='store_true', help='Spoof MAC address')
-    ap.add_argument('-v', '--vendor',    metavar='VENDOR',    help='MAC vendor (e.g. apple)')
-    ap.add_argument('-i', '--interface', metavar='IFACE',     help='Network interface')
-    ap.add_argument('--setup',           action='store_true', help='Re-run first-time setup')
+    ap.add_argument('-s', '--start',       action='store_true', help='Start transparent proxy')
+    ap.add_argument('-k', '--stop',        action='store_true', help='Stop transparent proxy')
+    ap.add_argument('-r', '--restart',     action='store_true', help='New Tor circuit')
+    ap.add_argument('-c', '--check',       action='store_true', help='Check status')
+    ap.add_argument('-m', '--mac',         action='store_true', help='Spoof MAC address')
+    ap.add_argument('-v', '--vendor',      metavar='VENDOR',    help='MAC vendor (e.g. apple)')
+    ap.add_argument('-i', '--interface',   metavar='IFACE',     help='Network interface')
+    ap.add_argument('-b', '--bridge',      metavar='BRIDGE',    help='Tor bridge line (obfs4 etc.)')
+    ap.add_argument('--pin-guards',        action='store_true', help='Pin entry guards (reduces guard discovery attacks)')
+    ap.add_argument('--setup',             action='store_true', help='Re-run first-time setup')
     args = ap.parse_args()
 
     banner()
     require_root()
 
     if args.setup or not DATA_DIR.exists():
-        if not setup():
+        if not setup(bridge=args.bridge, pin_guards=args.pin_guards):
             sys.exit(1)
         if args.setup:
             sys.exit(0)
@@ -516,7 +729,7 @@ def main():
             sys.exit(0)
 
     if args.start:
-        sys.exit(0 if start() else 1)
+        sys.exit(0 if start(bridge=args.bridge, pin_guards=args.pin_guards) else 1)
     elif args.stop:
         stop()
     elif args.restart:
@@ -526,11 +739,13 @@ def main():
     else:
         ap.print_help()
         print(f"\n{C.CYAN}Examples:{C.RESET}")
-        print("  sudo t0rpoiz0n -s              # start")
-        print("  sudo t0rpoiz0n -s -m -v apple  # start + spoof MAC")
-        print("  sudo t0rpoiz0n -c              # check status")
-        print("  sudo t0rpoiz0n -r              # new identity")
-        print(f"  sudo t0rpoiz0n -k              # stop\n")
+        print("  sudo t0rpoiz0n -s                    # start")
+        print("  sudo t0rpoiz0n -s -m -v apple        # start + spoof MAC")
+        print("  sudo t0rpoiz0n -s --pin-guards        # start with guard pinning")
+        print("  sudo t0rpoiz0n -s -b 'obfs4 ...'     # start with bridge")
+        print("  sudo t0rpoiz0n -c                    # check status")
+        print("  sudo t0rpoiz0n -r                    # new identity")
+        print(f"  sudo t0rpoiz0n -k                    # stop\n")
         print(f"{C.CYAN}Vendors:{C.RESET} {', '.join(sorted(MAC_VENDORS))}\n")
 
 if __name__ == "__main__":

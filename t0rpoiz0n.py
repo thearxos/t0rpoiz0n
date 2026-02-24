@@ -216,6 +216,10 @@ def create_iptables_rules_nft():
 # Block QUIC/HTTP3
 -A OUTPUT -p udp --dport 443 -j REJECT
 
+# CRITICAL: Don't redirect traffic from Tor itself (prevents routing loop)
+# Tor must run as user 'tor' (set via User= in torrc) for this to work
+-A OUTPUT -m owner --uid-owner tor -j RETURN
+
 # Don't redirect local traffic
 -A OUTPUT -d 127.0.0.0/8 -j RETURN
 -A OUTPUT -d 192.168.0.0/16 -j RETURN
@@ -257,7 +261,6 @@ COMMIT
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     rules_file = DATA_DIR / "iptables.rules"
     
-    # Force write new rules
     with open(rules_file, 'w') as f:
         f.write(rules)
     
@@ -365,6 +368,9 @@ def create_torrc():
     torrc = """# t0rpoiz0n Tor configuration
 # Auto-generated - Do not edit manually
 
+# User (required for traffic exemption via uid-owner)
+User tor
+
 # Ports
 SocksPort 9050
 TransPort 9040 IsolateClientAddr IsolateClientProtocol IsolateDestAddr IsolateDestPort
@@ -379,7 +385,6 @@ Log notice syslog
 
 # Security
 AvoidDiskWrites 1
-HardwareAccel 1
 
 # Don't be a relay
 ORPort 0
@@ -413,10 +418,6 @@ KillSignal=SIGINT
 TimeoutSec=60
 Restart=on-failure
 RestartSec=5
-
-# Security capabilities
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
-NoNewPrivileges=yes
 
 # Process management
 LimitNOFILE=65536
@@ -468,6 +469,9 @@ def first_time_setup():
     
     print(f"{Color.CYAN}[*] Creating Tor configuration...{Color.RESET}")
     create_torrc()
+    # Ensure tor user owns its data/cache directories
+    run_cmd("mkdir -p /var/lib/tor /var/cache/tor", check=False)
+    run_cmd("chown -R tor:tor /var/lib/tor /var/cache/tor 2>/dev/null || true", check=False)
     print(f"{Color.GREEN}[✓] Tor config created{Color.RESET}")
     
     print(f"{Color.CYAN}[*] Creating systemd service...{Color.RESET}")
@@ -477,7 +481,29 @@ def first_time_setup():
     print(f"\n{Color.GREEN}[✓] Setup complete!{Color.RESET}")
     return True
 
-def apply_ipv6_blocks_nft():
+def apply_tor_uid_exemption_nft():
+    """
+    Fallback: if --uid-owner in NAT table didn't work with iptables-nft-restore,
+    add the Tor traffic exemption directly via nft native syntax.
+    """
+    # Check if the owner rule was actually applied
+    check = run_cmd("iptables-nft -t nat -L OUTPUT -n | grep -i 'owner.*tor'", check=False)
+    if check.returncode == 0 and check.stdout.strip():
+        # Rule applied successfully via iptables-restore
+        return
+    
+    print(f"{Color.YELLOW}[!] Owner match not found in nat table, applying via native nft...{Color.RESET}")
+    # Insert before REDIRECT rule using native nft (requires knowing the rule position)
+    # Get the tor UID
+    uid_result = run_cmd("id -u tor 2>/dev/null", check=False)
+    if uid_result.returncode != 0 or not uid_result.stdout.strip():
+        print(f"{Color.RED}[✗] Could not get tor user UID - tor traffic may loop!{Color.RESET}")
+        return
+    
+    tor_uid = uid_result.stdout.strip()
+    # Add exemption rule to nft nat output chain (position 0 = highest priority)
+    run_cmd(f"nft insert rule ip nat output meta skuid {tor_uid} return 2>/dev/null || true", check=False)
+    print(f"{Color.GREEN}[✓] Tor traffic exemption applied via native nft (uid {tor_uid}){Color.RESET}")
     """Apply IPv6 blocks using nft directly for nftables backend"""
     print(f"{Color.CYAN}[*] Applying IPv6 blocks via nft...{Color.RESET}")
     
@@ -574,9 +600,10 @@ def start_transparent_proxy():
         run_cmd(f"cat {rules_path} | head -20", check=False)
         return False
     
-    # Additional IPv6 blocking for nft
+    # Additional IPv6 blocking and Tor uid exemption for nft
     if USING_NFT_BACKEND:
         apply_ipv6_blocks_nft()
+        apply_tor_uid_exemption_nft()
     
     # Wait for bootstrap
     print(f"{Color.CYAN}[*] Waiting for Tor to bootstrap...{Color.RESET}")
@@ -652,13 +679,21 @@ def restart_tor():
     
     result = run_cmd("systemctl restart tor-t0rpoiz0n.service", check=False)
     
-    if result.returncode == 0:
-        time.sleep(5)
+    if result.returncode != 0:
+        print(f"{Color.RED}[✗] Failed to restart Tor{Color.RESET}")
+        run_cmd("journalctl -u tor-t0rpoiz0n.service -n 10 --no-pager", check=False)
+        return False
+    
+    # Wait and verify it's actually running
+    time.sleep(5)
+    status = run_cmd("systemctl is-active tor-t0rpoiz0n.service", check=False)
+    if status.stdout.strip() == "active":
         print(f"{Color.GREEN}[✓] New Tor circuit established{Color.RESET}")
         check_tor_status()
         return True
     else:
-        print(f"{Color.RED}[✗] Failed to restart Tor{Color.RESET}")
+        print(f"{Color.RED}[✗] Tor restarted but service is not active{Color.RESET}")
+        run_cmd("journalctl -u tor-t0rpoiz0n.service -n 10 --no-pager", check=False)
         return False
 
 def check_tor_status():

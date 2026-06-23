@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# t0rctl — ARXOS anonymization control TUI (t0rpoiz0n front-end)
+set -o pipefail
+OB=$'\033[1;38;5;208m'; GR=$'\033[1;32m'; RD=$'\033[1;31m'
+DM=$'\033[90m'; BD=$'\033[1m'; RS=$'\033[0m'; WH=$'\033[1;37m'
+
+_on(){ pgrep -x tor >/dev/null 2>&1 && systemctl is-active tor-t0rpoiz0n >/dev/null 2>&1; }
+_torjson(){ curl -s --max-time 9 https://check.torproject.org/api/ip 2>/dev/null; }
+_pause(){ printf "\n  ${DM}press enter${RS} "; read -r _; }
+
+_header(){
+  clear
+  printf "\n  ${OB}t0r${WH}ctl${RS}  ${DM}anonymization toolkit${RS}\n"
+  printf "  ${DM}------------------------------------------${RS}\n"
+  if _on; then
+    local ip; ip=$(_torjson | grep -oE '"IP":"[^"]+"' | cut -d'"' -f4)
+    printf "   ${DM}%-9s${RS}${GR}routing through Tor${RS}\n" "status"
+    printf "   ${DM}%-9s${RS}%s\n" "exit ip" "${ip:-?}"
+  else
+    printf "   ${DM}%-9s${RS}${DM}clearnet (off)${RS}\n" "status"
+  fi
+  printf "   ${DM}%-9s${RS}%s\n" "iface" "$(ip route 2>/dev/null | awk '/default/{print $5; exit}')"
+  printf "  ${DM}------------------------------------------${RS}\n\n"
+}
+_menu(){
+  printf "   ${OB}1${RS}  start        ${DM}transparent Tor proxy${RS}\n"
+  printf "   ${OB}2${RS}  stop         ${DM}restore clearnet${RS}\n"
+  printf "   ${OB}3${RS}  new circuit  ${DM}fresh exit node${RS}\n"
+  printf "   ${OB}4${RS}  spoof MAC    ${DM}randomize hardware address${RS}\n"
+  printf "   ${OB}5${RS}  status       ${DM}full Tor + hardening report${RS}\n"
+  printf "   ${OB}6${RS}  leak test    ${DM}IP / DNS / IPv6 leak check${RS}\n"
+  printf "   ${OB}7${RS}  bridges      ${DM}obfs4 (anti-censorship)${RS}\n"
+  printf "   ${OB}8${RS}  pin guards   ${DM}reduce guard-discovery attacks${RS}\n"
+  printf "   ${OB}q${RS}  quit\n\n  ${BD}>${RS} "
+}
+act_start(){   clear; sudo t0rpoiz0n -s; _pause; }
+act_stop(){    clear; sudo t0rpoiz0n -k; _pause; }
+act_circuit(){ clear; sudo t0rpoiz0n -r; _pause; }
+act_mac(){     clear; printf "  vendor (apple/intel/dell · enter=random): "; read -r v
+               clear; if [ -n "$v" ]; then sudo t0rpoiz0n -m -v "$v"; else sudo t0rpoiz0n -m; fi; _pause; }
+act_status(){  clear; sudo t0rpoiz0n -c; _pause; }
+act_leak(){
+  clear; printf "\n  ${OB}leak test${RS}\n\n"
+  printf "   ${DM}%-12s${RS}%s\n" "public IP" "$(curl -s --max-time 10 https://api.ipify.org)"
+  local j; j=$(_torjson)
+  printf "   ${DM}%-12s${RS}%b\n" "through Tor" "$(echo "$j" | grep -q '\"IsTor\":true' && echo "${GR}yes${RS}" || echo "${RD}NO${RS}")"
+  printf "   ${DM}%-12s${RS}%s\n" "exit IP" "$(echo "$j" | grep -oE '\"IP\":\"[^\"]+\"' | cut -d'\"' -f4)"
+  printf "   ${DM}%-12s${RS}%s\n" "DNS server" "$(grep -m1 nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}')"
+  printf "   ${DM}%-12s${RS}%b\n" "IPv6" "$([ \"$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)\" = 1 ] && echo \"${GR}disabled${RS}\" || echo \"${RD}enabled${RS}\")"
+  _pause
+}
+act_bridges(){ clear; printf "  paste an obfs4 bridge line (enter to cancel):\n  > "; read -r b
+               [ -n "$b" ] && { clear; sudo t0rpoiz0n -s -b "$b"; }; _pause; }
+act_guards(){  clear; sudo t0rpoiz0n -s --pin-guards; _pause; }
+
+command -v t0rpoiz0n >/dev/null 2>&1 || { echo "t0rpoiz0n is not installed"; exit 1; }
+while true; do
+  _header; _menu; read -r c
+  case "$c" in
+    1) act_start;; 2) act_stop;; 3) act_circuit;; 4) act_mac;;
+    5) act_status;; 6) act_leak;; 7) act_bridges;; 8) act_guards;;
+    q|Q|"") clear; break;;
+  esac
+done

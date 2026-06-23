@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# t0r-gui — ARXOS anonymization GUI (GTK via yad). Opened from the top-panel button.
+ICON="security-high"
+_priv(){ if command -v pkexec >/dev/null 2>&1; then pkexec "$@"; else x-terminal-emulator -e sudo "$@" 2>/dev/null || sudo "$@"; fi; }
+command -v yad >/dev/null 2>&1 || { command -v t0rctl >/dev/null 2>&1 && exec x-terminal-emulator -e t0rctl; exit 1; }
+while true; do
+  if pgrep -x tor >/dev/null 2>&1 && systemctl is-active tor-t0rpoiz0n >/dev/null 2>&1; then
+    ip=$(curl -s --max-time 6 https://check.torproject.org/api/ip 2>/dev/null | grep -oE '"IP":"[^"]+"' | cut -d'"' -f4)
+    txt="<b>t0rpoiz0n</b>   <span color='#5fd17a'>● routing through Tor</span>\n\nExit IP:  <b>${ip:-resolving…}</b>"
+    yad --title="ARXOS Anonymization" --window-icon="$ICON" --width=460 --center --on-top --borders=16 \
+        --image="$ICON" --text="$txt" \
+        --button="New Circuit!view-refresh:3" --button="Status!dialog-information:4" \
+        --button="Stop!process-stop:5" --button="Close!window-close:1"
+    rc=$?
+  else
+    txt="<b>t0rpoiz0n</b>   <span color='#999'>○ clearnet (Tor off)</span>\n\nRoute all traffic through Tor — DNS-leak-closed, IPv6 off."
+    yad --title="ARXOS Anonymization" --window-icon="$ICON" --width=460 --center --on-top --borders=16 \
+        --image="$ICON" --text="$txt" \
+        --button="Start Tor!media-playback-start:2" --button="Start + Spoof MAC!network-wired:6" \
+        --button="Status!dialog-information:4" --button="Close!window-close:1"
+    rc=$?
+  fi
+  case "$rc" in
+    2) _priv t0rpoiz0n -s ;;
+    6) _priv t0rpoiz0n -s -m ;;
+    3) _priv t0rpoiz0n -r ;;
+    5) _priv t0rpoiz0n -k ;;
+    4) ( _priv t0rpoiz0n -c 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' ) | yad --text-info --width=660 --height=460 --title="Tor Status" --button="Close:1" ;;
+    *) break ;;
+  esac
+done

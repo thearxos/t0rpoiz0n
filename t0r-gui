@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+ARXOS_VERSION="0.0.1"   # ARXOS: every tool pinned to 0.0.1
+case "${1:-}" in --version|-V) echo "t0r-gui ${ARXOS_VERSION} (ARXOS)"; exit 0 ;; esac
 # t0r-gui — ARXOS anonymization GUI (GTK via yad). Opened from the top-panel button.
 ICON="security-high"
 _priv(){ if command -v pkexec >/dev/null 2>&1; then pkexec "$@"; else x-terminal-emulator -e sudo "$@" 2>/dev/null || sudo "$@"; fi; }

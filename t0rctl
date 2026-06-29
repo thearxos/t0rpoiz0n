@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+ARXOS_VERSION="0.0.1"   # ARXOS: every tool pinned to 0.0.1
+case "${1:-}" in --version|-V) echo "t0rctl ${ARXOS_VERSION} (ARXOS)"; exit 0 ;; esac
 # t0rctl — ARXOS anonymization control TUI (t0rpoiz0n front-end)
 set -o pipefail
 OB=$'\033[1;38;5;208m'; GR=$'\033[1;32m'; RD=$'\033[1;31m'

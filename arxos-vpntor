@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# arxos-vpntor 0.0.1 - VPN -> Tor chain for ArxOS-AnonKit.
+# Connects a VPN FIRST, then routes everything through Tor (VPN->Tor) so the ISP
+# only ever sees encrypted VPN traffic and never learns you use Tor. By default it
+# pulls a free VPNBook OpenVPN config + the current rotating password in real time.
+#
+#   arxos-vpntor                         auto: VPNBook free config -> VPN -> Tor
+#   arxos-vpntor --own FILE.ovpn [--user U --pass P]   your own VPN config -> Tor
+#   arxos-vpntor --stop                  tear down (Tor first, then VPN)
+#   arxos-vpntor --status                show VPN + Tor state
+#
+# NOTE: VPNBook is a FREE, shared VPN. You are trusting VPNBook instead of your ISP
+# (it could log). For serious OPSEC use your own trusted VPN (--own) or an obfs4 bridge.
+set -u
+GR=$'\033[1;32m'; AC=$'\033[38;5;208m'; RD=$'\033[1;31m'; DM=$'\033[90m'; RS=$'\033[0m'
+say(){ printf "  ${AC}>>${RS} %s\n" "$*"; }
+ok(){  printf "  ${GR}[ok]${RS} %s\n" "$*"; }
+err(){ printf "  ${RD}[xx]${RS} %s\n" "$*"; }
+[ "$(id -u)" -eq 0 ] || { err "must run as root (the AnonKit GUI elevates with pkexec)"; exit 1; }
+
+STATE=/run/arxos-vpntor; mkdir -p "$STATE"
+need(){ command -v "$1" >/dev/null 2>&1; }
+for p in openvpn curl unzip; do need "$p" || { say "installing $p"; pacman -S --noconfirm --needed "$p" >/dev/null 2>&1; }; done
+
+real_ip(){ curl -s --max-time 8 https://api.ipify.org 2>/dev/null; }
+vpn_up(){ ip -o link show up 2>/dev/null | grep -qE ': (tun|wg|tap)[0-9]'; }
+
+fetch_vpnbook(){
+  local d="$STATE/vpnbook"; rm -rf "$d"; mkdir -p "$d"
+  say "fetching the current VPNBook free config + password"
+  local page; page=$(curl -fsSL -A 'Mozilla/5.0' https://www.vpnbook.com/freevpn 2>/dev/null)
+  [ -z "$page" ] && { err "could not reach vpnbook.com"; return 1; }
+  local pass; pass=$(printf '%s' "$page" | tr '<>' '\n\n' | grep -iA1 'password' | grep -oE '[A-Za-z0-9]{5,}' | grep -viE 'password|strong|change' | head -1)
+  local zurl; zurl=$(printf '%s' "$page" | grep -oiE 'href="[^"]*openvpn[^"]*\.zip"' | head -1 | sed -E 's/.*href="([^"]+)".*/\1/i')
+  [ -z "$zurl" ] && zurl=$(printf '%s' "$page" | grep -oiE 'https?://[^"]*openvpn[^"]*\.zip' | head -1)
+  case "$zurl" in
+    /*) zurl="https://www.vpnbook.com$zurl" ;;
+    "") err "no VPNBook config link found (site format may have changed) - use --own FILE.ovpn"; return 1 ;;
+  esac
+  say "downloading $(basename "$zurl")"
+  curl -fsSL -A 'Mozilla/5.0' "$zurl" -o "$d/cfg.zip" || { err "config download failed"; return 1; }
+  unzip -P "${VPNBOOK_ZIP_PW:-}" -o -q "$d/cfg.zip" -d "$d" 2>/dev/null || unzip -o -q "$d/cfg.zip" -d "$d" 2>/dev/null || { err "could not unzip config"; return 1; }
+  local ovpn; ovpn=$(ls "$d"/*tcp443*.ovpn 2>/dev/null | head -1); [ -z "$ovpn" ] && ovpn=$(ls "$d"/*.ovpn 2>/dev/null | head -1)
+  [ -z "$ovpn" ] && { err "no .ovpn inside the VPNBook bundle"; return 1; }
+  printf 'vpnbook\n%s\n' "${pass:-unknown}" > "$d/creds"; chmod 600 "$d/creds"
+  [ "${pass:-}" ] && ok "got VPNBook password" || err "could not scrape the password - connect may fail (it rotates weekly)"
+  printf '%s|%s' "$ovpn" "$d/creds"
+}
+
+connect_vpn(){  # $1 ovpn  $2 creds(optional)
+  local ovpn="$1" creds="${2:-}"
+  say "connecting VPN: $(basename "$ovpn")"
+  pkill -f 'openvpn --config' 2>/dev/null; sleep 1
+  local args=(--config "$ovpn" --daemon --writepid "$STATE/openvpn.pid" --log "$STATE/openvpn.log" --auth-nocache --redirect-gateway def1)
+  [ -n "$creds" ] && args+=(--auth-user-pass "$creds")
+  openvpn "${args[@]}"
+  say "waiting for the tunnel to come up"
+  local i; for i in $(seq 1 30); do vpn_up && { ok "VPN tunnel up"; return 0; }; sleep 1; done
+  err "VPN did not come up - see $STATE/openvpn.log (VPNBook password rotates ~weekly)"; return 1
+}
+
+start(){
+  local ovpn creds before after
+  before=$(real_ip); say "real IP (no VPN): ${before:-?}"
+  if [ "${OWN:-}" ]; then
+    ovpn="$OWN"; creds=""
+    if [ "${VUSER:-}" ]; then creds="$STATE/creds"; printf '%s\n%s\n' "$VUSER" "${VPASS:-}" > "$creds"; chmod 600 "$creds"; fi
+  else
+    local r; r=$(fetch_vpnbook) || exit 1; ovpn="${r%%|*}"; creds="${r##*|}"
+  fi
+  connect_vpn "$ovpn" "$creds" || exit 1
+  after=$(real_ip); say "IP through VPN: ${after:-?}"
+  [ -n "$after" ] && [ "$after" = "$before" ] && err "warning: IP did not change - the VPN may not be routing"
+  say "chaining into Tor (VPN -> Tor)"
+  t0rpoiz0n -s || { err "Tor start failed"; exit 1; }
+  ok "VPN -> Tor is active. Your ISP sees only the VPN; Tor is hidden behind it."
+  say "verify the whole chain:  sudo t0rpoiz0n --safe"
+}
+
+stop(){
+  say "stopping Tor"; t0rpoiz0n -k 2>/dev/null
+  say "stopping VPN"; pkill -f 'openvpn --config' 2>/dev/null
+  [ -f "$STATE/openvpn.pid" ] && kill "$(cat "$STATE/openvpn.pid")" 2>/dev/null
+  ok "VPN -> Tor torn down; back to clearnet"
+}
+
+case "${1:-}" in
+  --stop)   stop ;;
+  --status) vpn_up && ok "VPN: up" || err "VPN: down"
+            systemctl is-active tor-t0rpoiz0n >/dev/null 2>&1 && ok "Tor: active" || err "Tor: off" ;;
+  --own)    OWN="${2:-}"; shift 2 || true
+            while [ $# -gt 0 ]; do case "$1" in --user) VUSER="$2"; shift 2;; --pass) VPASS="$2"; shift 2;; *) shift;; esac; done
+            [ -n "${OWN:-}" ] || { err "--own needs a FILE.ovpn"; exit 1; }; start ;;
+  --version|-V) echo "arxos-vpntor $VERSION (ArxOS)" 2>/dev/null || echo "arxos-vpntor 0.0.1" ;;
+  *)        start ;;
+esac

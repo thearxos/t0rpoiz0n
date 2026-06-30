@@ -1,33 +1,175 @@
-#!/usr/bin/env bash
-ARXOS_VERSION="0.0.1"   # ARXOS: every tool pinned to 0.0.1
-case "${1:-}" in --version|-V) echo "t0r-gui ${ARXOS_VERSION} (ARXOS)"; exit 0 ;; esac
-# t0r-gui — ARXOS anonymization GUI (GTK via yad). Opened from the top-panel button.
-ICON="security-high"
-_priv(){ if command -v pkexec >/dev/null 2>&1; then pkexec "$@"; else x-terminal-emulator -e sudo "$@" 2>/dev/null || sudo "$@"; fi; }
-command -v yad >/dev/null 2>&1 || { command -v t0rctl >/dev/null 2>&1 && exec x-terminal-emulator -e t0rctl; exit 1; }
-while true; do
-  if pgrep -x tor >/dev/null 2>&1 && systemctl is-active tor-t0rpoiz0n >/dev/null 2>&1; then
-    ip=$(curl -s --max-time 6 https://check.torproject.org/api/ip 2>/dev/null | grep -oE '"IP":"[^"]+"' | cut -d'"' -f4)
-    txt="<b>t0rpoiz0n</b>   <span color='#5fd17a'>● routing through Tor</span>\n\nExit IP:  <b>${ip:-resolving…}</b>"
-    yad --title="ARXOS Anonymization" --window-icon="$ICON" --width=460 --center --on-top --borders=16 \
-        --image="$ICON" --text="$txt" \
-        --button="New Circuit!view-refresh:3" --button="Status!dialog-information:4" \
-        --button="Stop!process-stop:5" --button="Close!window-close:1"
-    rc=$?
-  else
-    txt="<b>t0rpoiz0n</b>   <span color='#999'>○ clearnet (Tor off)</span>\n\nRoute all traffic through Tor — DNS-leak-closed, IPv6 off."
-    yad --title="ARXOS Anonymization" --window-icon="$ICON" --width=460 --center --on-top --borders=16 \
-        --image="$ICON" --text="$txt" \
-        --button="Start Tor!media-playback-start:2" --button="Start + Spoof MAC!network-wired:6" \
-        --button="Status!dialog-information:4" --button="Close!window-close:1"
-    rc=$?
-  fi
-  case "$rc" in
-    2) _priv t0rpoiz0n -s ;;
-    6) _priv t0rpoiz0n -s -m ;;
-    3) _priv t0rpoiz0n -r ;;
-    5) _priv t0rpoiz0n -k ;;
-    4) ( _priv t0rpoiz0n -c 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' ) | yad --text-info --width=660 --height=460 --title="Tor Status" --button="Close:1" ;;
-    *) break ;;
-  esac
-done
+#!/usr/bin/env python3
+# t0r-gui 0.0.1 - ArxOS-AnonKit GUI (GTK3), ArxOS-styled. Full anonymization control:
+# transparent Tor, new identity, MAC spoof, obfs4 bridges, VPN->Tor (VPNBook or your own),
+# and a one-click safety/leak test. Privileged actions elevate with pkexec.
+import gi, subprocess, threading, re, sys
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib
+
+VERSION = "0.0.1"; AC = "#e8702a"
+ICON = "/usr/share/icons/ArxOS/arxos-anonkit.png"
+VENDORS = ["random", "apple", "samsung", "intel", "dell", "cisco", "tp-link", "huawei"]
+
+CSS = ("""
+window { background:#0a0a0c; }
+.title { font-weight:800; font-size:20px; color:#ffffff; }
+.ver   { color:%(a)s; font-size:10px; font-weight:700; letter-spacing:1px; }
+.status{ font-size:12px; color:#c9c9d0; }
+.sub   { color:#8a8a92; font-size:11px; }
+.tip   { color:#cdb892; font-size:11px; font-style:italic; }
+button.act { background:rgba(255,255,255,0.05); border:1px solid rgba(232,112,42,0.40); border-radius:9px; color:#eee; padding:9px 12px; }
+button.act:hover { background:rgba(232,112,42,0.18); border-color:%(a)s; }
+button.go { background:rgba(95,209,122,0.13); border:1px solid rgba(95,209,122,0.45); }
+button.go:hover { background:rgba(95,209,122,0.24); border-color:#5fd17a; }
+button.stop { border-color:rgba(255,90,90,0.45); }
+button.stop:hover { background:rgba(255,90,90,0.18); border-color:#ff5a5a; }
+.term { background:#050506; color:#cfd2d6; font-family:monospace; font-size:11px; border:1px solid rgba(232,112,42,0.22); border-radius:8px; padding:6px; }
+entry { background:#050506; color:#c9c9d0; border:1px solid rgba(232,112,42,0.25); border-radius:7px; }
+""" % {"a": AC}).encode()
+
+
+def sh(c, t=8):
+    try: return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=t).stdout.strip()
+    except Exception: return ""
+
+
+class Anon(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="ArxOS AnonKit")
+        self.set_default_size(560, 580); self.set_position(Gtk.WindowPosition.CENTER)
+        try: self.set_icon_from_file(ICON)
+        except Exception: pass
+        p = Gtk.CssProvider(); p.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        self.exit_ip = ""
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for m in ("set_margin_top", "set_margin_bottom", "set_margin_start", "set_margin_end"): getattr(root, m)(16)
+        self.add(root)
+
+        hb = Gtk.Box(spacing=12)
+        try:
+            img = Gtk.Image.new_from_file(ICON); img.set_pixel_size(38); hb.pack_start(img, False, False, 0)
+        except Exception: pass
+        tcol = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        t = Gtk.Label(); t.set_markup("<span font='20' weight='800'>ArxOS <span foreground='%s'>AnonKit</span></span>" % AC)
+        t.set_xalign(0); t.get_style_context().add_class("title"); tcol.pack_start(t, False, False, 0)
+        v = Gtk.Label(label="REAL-WORLD OPSEC  ·  v" + VERSION); v.set_xalign(0); v.get_style_context().add_class("ver")
+        tcol.pack_start(v, False, False, 0); hb.pack_start(tcol, False, False, 0)
+        root.pack_start(hb, False, False, 0)
+
+        self.status = Gtk.Label(); self.status.set_xalign(0); self.status.get_style_context().add_class("status")
+        self.status.set_line_wrap(True); root.pack_start(self.status, False, False, 0)
+        root.pack_start(Gtk.Separator(), False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8, column_homogeneous=True)
+        acts = [
+            ("Start Tor",    "go",  lambda *_: self._priv(["t0rpoiz0n", "-s"])),
+            ("VPN → Tor", "go", self._vpntor),
+            ("New Identity", "act", lambda *_: self._priv(["t0rpoiz0n", "-r"])),
+            ("Safety Test",  "act", lambda *_: self._priv(["t0rpoiz0n", "--safe"])),
+            ("Spoof MAC",    "act", self._spoof),
+            ("Bridge…", "act", self._bridge),
+        ]
+        for i, (lbl, cls, cb) in enumerate(acts):
+            b = Gtk.Button(label=lbl); b.get_style_context().add_class("act")
+            if cls != "act": b.get_style_context().add_class(cls)
+            b.connect("clicked", cb); grid.attach(b, i % 3, i // 3, 1, 1)
+        root.pack_start(grid, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        ml = Gtk.Label(label="MAC vendor"); ml.get_style_context().add_class("sub"); row.pack_start(ml, False, False, 0)
+        self.vendor = Gtk.ComboBoxText()
+        for vn in VENDORS: self.vendor.append_text(vn)
+        self.vendor.set_active(0); row.pack_start(self.vendor, False, False, 0)
+        stopb = Gtk.Button(label="Stop / Clearnet"); stopb.get_style_context().add_class("act"); stopb.get_style_context().add_class("stop")
+        stopb.connect("clicked", lambda *_: self._priv(["t0rpoiz0n", "-k"])); row.pack_end(stopb, False, False, 0)
+        root.pack_start(row, False, False, 0)
+
+        tip = Gtk.Label(); tip.set_xalign(0); tip.get_style_context().add_class("tip"); tip.set_line_wrap(True)
+        tip.set_text("VPN → Tor connects a VPN first, then Tor — so your ISP only sees the VPN and never learns you use Tor.")
+        root.pack_start(tip, False, False, 0)
+
+        self.out = Gtk.TextView(); self.out.set_editable(False); self.out.set_monospace(True)
+        self.out.get_style_context().add_class("term"); self.buf = self.out.get_buffer()
+        sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC); sc.add(self.out)
+        root.pack_start(sc, True, True, 0)
+
+        self._refresh(); GLib.timeout_add_seconds(4, self._refresh)
+
+    def _append(self, txt):
+        self.buf.insert(self.buf.get_end_iter(), txt)
+        self.out.scroll_to_mark(self.buf.get_insert(), 0, False, 0, 0); return False
+
+    def _priv(self, args):
+        self._append("\n$ %s\n" % " ".join(args))
+        def run():
+            try:
+                pr = subprocess.Popen(["pkexec"] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                for line in pr.stdout:
+                    GLib.idle_add(self._append, re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", line))
+                pr.wait()
+            except Exception as e:
+                GLib.idle_add(self._append, "error: %s\n" % e)
+            GLib.idle_add(self._append, "— done —\n")
+            GLib.idle_add(self._refresh)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _spoof(self, *_):
+        v = self.vendor.get_active_text() or "random"
+        args = ["t0rpoiz0n", "-m"]
+        if v != "random": args += ["-v", v]
+        self._priv(args)
+
+    def _bridge(self, *_):
+        d = Gtk.Dialog(title="obfs4 bridge", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Start", Gtk.ResponseType.OK)
+        lab = Gtk.Label(label="Paste a bridge line (hides Tor from your ISP's DPI without a VPN):"); lab.set_xalign(0)
+        e = Gtk.Entry(); e.set_placeholder_text("obfs4 1.2.3.4:443 FINGERPRINT cert=... iat-mode=0"); e.set_size_request(420, -1)
+        box = d.get_content_area(); box.set_spacing(6); box.add(lab); box.add(e); d.show_all()
+        ok = d.run() == Gtk.ResponseType.OK; line = e.get_text().strip(); d.destroy()
+        if ok and line: self._priv(["t0rpoiz0n", "-s", "-b", line])
+
+    def _vpntor(self, *_):
+        d = Gtk.Dialog(title="VPN → Tor", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Use my .ovpn", 2, "Free VPNBook", Gtk.ResponseType.OK)
+        m = Gtk.Label(); m.set_line_wrap(True); m.set_xalign(0)
+        m.set_markup("Connect a VPN first, then Tor.\n\n<b>Free VPNBook</b>: pulls a free public config automatically "
+                     "(you trust VPNBook, not your ISP — it could log).\n<b>Use my .ovpn</b>: your own trusted VPN (recommended).")
+        d.get_content_area().add(m); d.show_all()
+        r = d.run(); d.destroy()
+        if r == Gtk.ResponseType.OK:
+            self._priv(["arxos-vpntor"])
+        elif r == 2:
+            fc = Gtk.FileChooserDialog(title="Select .ovpn", parent=self, action=Gtk.FileChooserAction.OPEN)
+            fc.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Connect", Gtk.ResponseType.OK)
+            ff = Gtk.FileFilter(); ff.set_name("OpenVPN"); ff.add_pattern("*.ovpn"); ff.add_pattern("*.conf"); fc.add_filter(ff)
+            ok = fc.run() == Gtk.ResponseType.OK; f = fc.get_filename(); fc.destroy()
+            if ok and f: self._priv(["arxos-vpntor", "--own", f])
+
+    def _refresh(self):
+        tor = sh("systemctl is-active tor-t0rpoiz0n") == "active"
+        vpn = bool(sh("ip -o link show up 2>/dev/null | grep -oE ': (tun|wg|tap)[0-9]'"))
+        parts = []
+        if tor:
+            parts.append("<span foreground='#5fd17a' weight='700'>● Tor active</span>" + ("  ·  exit %s" % self.exit_ip if self.exit_ip else ""))
+        else:
+            parts.append("<span foreground='#8a8a92'>○ clearnet (Tor off)</span>")
+        parts.append("<span foreground='#5fd17a'>VPN up</span>" if vpn else "<span foreground='#8a8a92'>no VPN</span>")
+        if tor and not vpn:
+            parts.append("<span foreground='%s'>ISP can see Tor — use VPN→Tor or a bridge</span>" % AC)
+        self.status.set_markup("   ·   ".join(parts))
+        if tor and not self.exit_ip:
+            def ipget():
+                ip = sh("curl -s --max-time 8 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip", 10)
+                mm = re.search(r'"IP":"([^"]+)"', ip or "")
+                if mm: self.exit_ip = mm.group(1)
+            threading.Thread(target=ipget, daemon=True).start()
+        if not tor: self.exit_ip = ""
+        return True
+
+
+if __name__ == "__main__":
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print("t0r-gui %s (ArxOS)" % VERSION); sys.exit(0)
+    w = Anon(); w.connect("destroy", Gtk.main_quit); w.show_all(); Gtk.main()

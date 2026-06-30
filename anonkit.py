@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-t0rpoiz0n - Tor Transparent Proxy + MAC Spoofing
+ArxOS AnonKit - Tor transparent proxy, MAC spoofing, VPN->Tor, Snowflake
 Author : 0xb0rn3 | oxbv1
-Version: 1.2.0
+Version: 0.0.1
 Target : Arch Linux
 """
 
@@ -112,17 +112,10 @@ def run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
 # ── Banner ────────────────────────────────────────────────────────────────────
 
 _BANNER = r"""
-   /$$      /$$$$$$                                /$$            /$$$$$$
-  | $$     /$$$_  $$                              |__/           /$$$_  $$
- /$$$$$$  | $$$$\ $$  /$$$$$$   /$$$$$$   /$$$$$$  /$$ /$$$$$$$$| $$$$\ $$ /$$$$$$$
-|_  $$_/  | $$ $$ $$ /$$__  $$ /$$__  $$ /$$__  $$| $$|____ /$$/| $$ $$ $$| $$__  $$
-  | $$    | $$\ $$$$| $$  \__/| $$  \ $$| $$  \ $$| $$   /$$$$/ | $$\ $$$$| $$  \ $$
-  | $$ /$$| $$ \ $$$| $$      | $$  | $$| $$  | $$| $$  /$$__/  | $$ \ $$$| $$  | $$
-  |  $$$$/|  $$$$$$/| $$      | $$$$$$$/|  $$$$$$/| $$ /$$$$$$$$|  $$$$$$/| $$  | $$
-   \___/   \______/ |__/      | $$____/  \______/ |__/|________/ \______/ |__/  |__/
-                              | $$
-                              |__/
-          TOR PROXY & MAC SPOOFING FRAMEWORK  ·  v1.2.0  ·  by oxbv1
+        ▄▀█ █▀█ ▀▄▀ █▀█ █▀   ▄▀█ █▄░█ █▀█ █▄░█ █▄▀ █ ▀█▀
+        █▀█ █▀▄ █░█ █▄█ ▄█   █▀█ █░▀█ █▄█ █░▀█ █░█ █ ░█░
+
+     REAL-WORLD OPSEC   ·   Tor · MAC · VPN→Tor · Snowflake   ·   v0.0.1
 """
 
 def banner():
@@ -425,9 +418,13 @@ BandwidthBurst 2 MB
 
     if bridge:
         torrc += f"\n# Pluggable transport bridge (bypasses DPI)\nUseBridges 1\nBridge {bridge}\n"
-        # If obfs4, enable the client transport plugin
-        if bridge.lower().startswith("obfs4"):
+        bl = bridge.lower()
+        if bl.startswith("obfs4"):
             torrc += "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
+        elif bl.startswith("snowflake"):
+            torrc += f"ClientTransportPlugin snowflake exec {snowflake_bin()}\n"
+        elif bl.startswith("meek"):
+            torrc += "ClientTransportPlugin meek_lite exec /usr/bin/obfs4proxy\n"
 
     if pin_guards:
         # Minimise guard rotation to reduce guard discovery attack surface.
@@ -449,7 +446,7 @@ GuardLifetime 12 months
 
 _SERVICE = """\
 [Unit]
-Description=t0rpoiz0n Tor Transparent Proxy
+Description=ArxOS AnonKit Tor Transparent Proxy
 After=network.target
 
 [Service]
@@ -688,7 +685,7 @@ def status() -> bool:
     if stats.returncode == 0:
         print(f"\n{C.CYAN}iptables ({Backend.cmd}):{C.RESET}\n{stats.stdout}")
 
-    print(f"{C.YELLOW}Tip:{C.RESET} run  sudo t0rpoiz0n --safe  for a full leak + VPN→Tor safety test\n")
+    print(f"{C.YELLOW}Tip:{C.RESET} run  sudo anonkit --safe  for a full leak + VPN→Tor safety test\n")
     return True
 
 
@@ -710,7 +707,7 @@ def network_safety() -> bool:
     safe = True
 
     if run("systemctl is-active tor-t0rpoiz0n.service", check=False).stdout.strip() != "active":
-        err("Tor service is not active — you are NOT protected. Start it: sudo t0rpoiz0n -s")
+        err("Tor service is not active — you are NOT protected. Start it: sudo anonkit -s")
         return False
 
     # 1. SOCKS path exits via Tor
@@ -760,8 +757,8 @@ def network_safety() -> bool:
     else:
         warn("No VPN and no bridge — your ISP can SEE that you connect to Tor (not what you do).")
         print(f"{C.YELLOW}    Tip:{C.RESET} the safe order is VPN → Tor. Connect a trusted VPN FIRST, then")
-        print( "         start t0rpoiz0n: your ISP then only sees encrypted VPN traffic, never Tor.")
-        print( "         (Alternative without a VPN: an obfs4 bridge —  sudo t0rpoiz0n -s -b 'obfs4 ...')")
+        print( "         start AnonKit: your ISP then only sees encrypted VPN traffic, never Tor.")
+        print( "         (Alternative without a VPN: an obfs4 bridge —  sudo anonkit -s -b 'obfs4 ...')")
 
     # 7. MAC posture
     ifc = default_interface()
@@ -778,11 +775,43 @@ def network_safety() -> bool:
         print(f"{C.RED}{'='*60}\n[✗] VERDICT: AT RISK — fix the red items above before trusting this link.\n{'='*60}{C.RESET}\n")
     return safe
 
+# ── Snowflake bridge (free, no account, hides Tor from the ISP over WebRTC) ─────
+SNOWFLAKE_BRIDGE = (
+    "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 "
+    "fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 "
+    "url=https://1098762253.rsc.cdn77.org/ fronts=www.cdn77.com,www.phpmyadmin.net "
+    "ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,stun:stun.epygi.com:3478,"
+    "stun:stun.sonetel.com:3478,stun:stun.voipgate.com:3478 utls-imitate=hellorandomizedalpn")
+
+def snowflake_bin() -> str:
+    for p in ("/usr/bin/snowflake-client", "/usr/bin/snowflake",
+              os.path.expanduser("~/go/bin/snowflake-client")):
+        if os.path.exists(p): return p
+    r = run("command -v snowflake-client snowflake 2>/dev/null", check=False)
+    out = (r.stdout or "").strip().splitlines()
+    return out[0] if out else "/usr/bin/snowflake-client"
+
+def ensure_snowflake() -> bool:
+    if os.path.exists(snowflake_bin()) or run("command -v snowflake-client", check=False).returncode == 0:
+        return True
+    info("Installing the Snowflake client (one-time)...")
+    for cmd in ("pacman -S --noconfirm --needed snowflake",
+                "yay -S --noconfirm --needed snowflake-bin",
+                "yay -S --noconfirm --needed snowflake",
+                "GOBIN=/usr/bin go install gitlab.torproject.org/tpo/anti-censorship/"
+                "pluggable-transports/snowflake/v2/client@latest"):
+        run(cmd, check=False)
+        if run("command -v snowflake-client", check=False).returncode == 0 or os.path.exists(snowflake_bin()):
+            ok("snowflake-client installed"); return True
+    err("could not install snowflake-client (try: yay -S snowflake)")
+    return False
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
-        description='t0rpoiz0n — Tor transparent proxy + MAC spoofing',
+        description='ArxOS AnonKit - Tor transparent proxy, MAC spoofing, VPN->Tor, Snowflake',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument('-s', '--start',       action='store_true', help='Start transparent proxy')
@@ -795,11 +824,20 @@ def main():
     ap.add_argument('-b', '--bridge',      metavar='BRIDGE',    help='Tor bridge line (obfs4 etc.)')
     ap.add_argument('--pin-guards',        action='store_true', help='Pin entry guards (reduces guard discovery attacks)')
     ap.add_argument('--safe',              action='store_true', help='Deep network safety + leak test (real IP, DNS, IPv6, VPN→Tor, kill-switch)')
+    ap.add_argument('--snowflake',         action='store_true', help='Start Tor over a Snowflake bridge (free, no account) to hide Tor from your ISP')
     ap.add_argument('--setup',             action='store_true', help='Re-run first-time setup')
     args = ap.parse_args()
 
     banner()
     require_root()
+
+    if args.snowflake:
+        if not ensure_snowflake():
+            sys.exit(1)
+        if not args.bridge:
+            args.bridge = SNOWFLAKE_BRIDGE
+        args.start = True
+        info("Snowflake bridge selected - hiding Tor from your ISP (free, no account, over WebRTC)")
 
     if args.setup or not DATA_DIR.exists():
         if not setup(bridge=args.bridge, pin_guards=args.pin_guards):
@@ -829,14 +867,14 @@ def main():
     else:
         ap.print_help()
         print(f"\n{C.CYAN}Examples:{C.RESET}")
-        print("  sudo t0rpoiz0n -s                    # start")
-        print("  sudo t0rpoiz0n -s -m -v apple        # start + spoof MAC")
-        print("  sudo t0rpoiz0n -s --pin-guards        # start with guard pinning")
-        print("  sudo t0rpoiz0n -s -b 'obfs4 ...'     # start with bridge")
-        print("  sudo t0rpoiz0n -c                    # check status")
-        print("  sudo t0rpoiz0n --safe                # full leak + VPN→Tor safety test")
-        print("  sudo t0rpoiz0n -r                    # new identity")
-        print(f"  sudo t0rpoiz0n -k                    # stop\n")
+        print("  sudo anonkit -s                    # start")
+        print("  sudo anonkit -s -m -v apple        # start + spoof MAC")
+        print("  sudo anonkit -s --pin-guards        # start with guard pinning")
+        print("  sudo anonkit -s -b 'obfs4 ...'     # start with bridge")
+        print("  sudo anonkit -c                    # check status")
+        print("  sudo anonkit --safe                # full leak + VPN→Tor safety test")
+        print("  sudo anonkit -r                    # new identity")
+        print(f"  sudo anonkit -k                    # stop\n")
         print(f"{C.CYAN}Vendors:{C.RESET} {', '.join(sorted(MAC_VENDORS))}\n")
 
 if __name__ == "__main__":

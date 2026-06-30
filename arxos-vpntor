@@ -91,13 +91,13 @@ start(){
   after=$(real_ip); say "IP through VPN: ${after:-?}"
   [ -n "$after" ] && [ "$after" = "$before" ] && err "warning: IP did not change - the VPN may not be routing"
   say "chaining into Tor (VPN -> Tor)"
-  t0rpoiz0n -s || { err "Tor start failed"; exit 1; }
+  anonkit -s || { err "Tor start failed"; exit 1; }
   ok "VPN -> Tor active. Your ISP sees only the VPN; Tor is hidden behind it."
-  say "verify the whole chain:  sudo t0rpoiz0n --safe"
+  say "verify the whole chain:  sudo anonkit --safe"
 }
 
 stop(){
-  say "stopping Tor"; t0rpoiz0n -k 2>/dev/null
+  say "stopping Tor"; anonkit -k 2>/dev/null
   say "stopping VPN"; pkill -f 'openvpn --config' 2>/dev/null
   [ -f "$STATE/openvpn.pid" ] && kill "$(cat "$STATE/openvpn.pid")" 2>/dev/null
   ok "VPN -> Tor torn down; back to clearnet"

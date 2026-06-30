@@ -64,10 +64,11 @@ class Anon(Gtk.Window):
 
         grid = Gtk.Grid(column_spacing=8, row_spacing=8, column_homogeneous=True)
         acts = [
-            ("Start Tor",    "go",  lambda *_: self._priv(["t0rpoiz0n", "-s"])),
+            ("Start Tor",    "go",  lambda *_: self._priv(["anonkit", "-s"])),
             ("VPN → Tor", "go", self._vpntor),
-            ("New Identity", "act", lambda *_: self._priv(["t0rpoiz0n", "-r"])),
-            ("Safety Test",  "act", lambda *_: self._priv(["t0rpoiz0n", "--safe"])),
+            ("Snowflake",    "go",  lambda *_: self._priv(["anonkit", "--snowflake"])),
+            ("New Identity", "act", lambda *_: self._priv(["anonkit", "-r"])),
+            ("Safety Test",  "act", lambda *_: self._priv(["anonkit", "--safe"])),
             ("Spoof MAC",    "act", self._spoof),
             ("Bridge…", "act", self._bridge),
         ]
@@ -83,11 +84,11 @@ class Anon(Gtk.Window):
         for vn in VENDORS: self.vendor.append_text(vn)
         self.vendor.set_active(0); row.pack_start(self.vendor, False, False, 0)
         stopb = Gtk.Button(label="Stop / Clearnet"); stopb.get_style_context().add_class("act"); stopb.get_style_context().add_class("stop")
-        stopb.connect("clicked", lambda *_: self._priv(["t0rpoiz0n", "-k"])); row.pack_end(stopb, False, False, 0)
+        stopb.connect("clicked", lambda *_: self._priv(["anonkit", "-k"])); row.pack_end(stopb, False, False, 0)
         root.pack_start(row, False, False, 0)
 
         tip = Gtk.Label(); tip.set_xalign(0); tip.get_style_context().add_class("tip"); tip.set_line_wrap(True)
-        tip.set_text("VPN → Tor connects a VPN first, then Tor — so your ISP only sees the VPN and never learns you use Tor.")
+        tip.set_text("Hide Tor from your ISP: Snowflake (free, no account, over WebRTC) or VPN → Tor (a VPN first, then Tor).")
         root.pack_start(tip, False, False, 0)
 
         self.out = Gtk.TextView(); self.out.set_editable(False); self.out.set_monospace(True)
@@ -117,7 +118,7 @@ class Anon(Gtk.Window):
 
     def _spoof(self, *_):
         v = self.vendor.get_active_text() or "random"
-        args = ["t0rpoiz0n", "-m"]
+        args = ["anonkit", "-m"]
         if v != "random": args += ["-v", v]
         self._priv(args)
 
@@ -128,7 +129,7 @@ class Anon(Gtk.Window):
         e = Gtk.Entry(); e.set_placeholder_text("obfs4 1.2.3.4:443 FINGERPRINT cert=... iat-mode=0"); e.set_size_request(420, -1)
         box = d.get_content_area(); box.set_spacing(6); box.add(lab); box.add(e); d.show_all()
         ok = d.run() == Gtk.ResponseType.OK; line = e.get_text().strip(); d.destroy()
-        if ok and line: self._priv(["t0rpoiz0n", "-s", "-b", line])
+        if ok and line: self._priv(["anonkit", "-s", "-b", line])
 
     def _ovpn_pick(self, title):
         fc = Gtk.FileChooserDialog(title=title, parent=self, action=Gtk.FileChooserAction.OPEN)

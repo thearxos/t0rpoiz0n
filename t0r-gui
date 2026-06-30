@@ -130,22 +130,49 @@ class Anon(Gtk.Window):
         ok = d.run() == Gtk.ResponseType.OK; line = e.get_text().strip(); d.destroy()
         if ok and line: self._priv(["t0rpoiz0n", "-s", "-b", line])
 
+    def _ovpn_pick(self, title):
+        fc = Gtk.FileChooserDialog(title=title, parent=self, action=Gtk.FileChooserAction.OPEN)
+        fc.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Connect", Gtk.ResponseType.OK)
+        ff = Gtk.FileFilter(); ff.set_name("OpenVPN config / zip")
+        for pat in ("*.ovpn", "*.conf", "*.zip"): ff.add_pattern(pat)
+        fc.add_filter(ff)
+        ok = fc.run() == Gtk.ResponseType.OK; f = fc.get_filename(); fc.destroy()
+        return f if ok else None
+
+    def _ask(self, title, placeholder):
+        d = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
+        e = Gtk.Entry(); e.set_placeholder_text(placeholder); e.set_activates_default(True); e.set_size_request(320, -1)
+        d.get_content_area().add(e); d.set_default_response(Gtk.ResponseType.OK); d.show_all()
+        v = e.get_text().strip() if d.run() == Gtk.ResponseType.OK else None
+        d.destroy(); return v
+
     def _vpntor(self, *_):
         d = Gtk.Dialog(title="VPN → Tor", transient_for=self, modal=True)
-        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Use my .ovpn", 2, "Free VPNBook", Gtk.ResponseType.OK)
-        m = Gtk.Label(); m.set_line_wrap(True); m.set_xalign(0)
-        m.set_markup("Connect a VPN first, then Tor.\n\n<b>Free VPNBook</b>: pulls a free public config automatically "
-                     "(you trust VPNBook, not your ISP — it could log).\n<b>Use my .ovpn</b>: your own trusted VPN (recommended).")
+        d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        d.add_button("My .ovpn", 2); d.add_button("VPN Gate (auto)", 3); d.add_button("VPNBook (fastest)", 4)
+        m = Gtk.Label(); m.set_line_wrap(True); m.set_xalign(0); m.set_max_width_chars(58)
+        m.set_markup("Connect a VPN first, then Tor — your ISP only sees the VPN, never Tor.\n\n"
+                     "<b>VPNBook (fastest)</b>: dedicated servers, but VPNBook gates the config behind a CAPTCHA, "
+                     "so this opens their page — download a config and copy the password, then pick the file here.\n"
+                     "<b>VPN Gate (auto)</b>: fully automatic free public relays (slower, nothing to download).\n"
+                     "<b>My .ovpn</b>: your own trusted VPN (best for real OPSEC).")
         d.get_content_area().add(m); d.show_all()
         r = d.run(); d.destroy()
-        if r == Gtk.ResponseType.OK:
+        if r == 3:
             self._priv(["arxos-vpntor"])
         elif r == 2:
-            fc = Gtk.FileChooserDialog(title="Select .ovpn", parent=self, action=Gtk.FileChooserAction.OPEN)
-            fc.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Connect", Gtk.ResponseType.OK)
-            ff = Gtk.FileFilter(); ff.set_name("OpenVPN"); ff.add_pattern("*.ovpn"); ff.add_pattern("*.conf"); fc.add_filter(ff)
-            ok = fc.run() == Gtk.ResponseType.OK; f = fc.get_filename(); fc.destroy()
-            if ok and f: self._priv(["arxos-vpntor", "--own", f])
+            f = self._ovpn_pick("Select your .ovpn")
+            if f: self._priv(["arxos-vpntor", "--own", f])
+        elif r == 4:
+            try: subprocess.Popen(["xdg-open", "https://www.vpnbook.com/freevpn"])
+            except Exception: pass
+            f = self._ovpn_pick("Pick the VPNBook .ovpn / .zip you downloaded")
+            if not f: return
+            pw = self._ask("VPNBook password", "paste the password shown on vpnbook.com")
+            args = ["arxos-vpntor", "--own", f, "--user", "vpnbook"]
+            if pw: args += ["--pass", pw]
+            self._priv(args)
 
     def _refresh(self):
         tor = sh("systemctl is-active tor-t0rpoiz0n") == "active"

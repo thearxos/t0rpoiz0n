@@ -688,8 +688,95 @@ def status() -> bool:
     if stats.returncode == 0:
         print(f"\n{C.CYAN}iptables ({Backend.cmd}):{C.RESET}\n{stats.stdout}")
 
-    print(f"{C.YELLOW}Tip:{C.RESET} verify as regular user — curl https://check.torproject.org/api/ip\n")
+    print(f"{C.YELLOW}Tip:{C.RESET} run  sudo t0rpoiz0n --safe  for a full leak + VPN→Tor safety test\n")
     return True
+
+
+def detect_vpn():
+    """(active, kind, iface): a tun/WireGuard tunnel that could carry traffic before Tor."""
+    r = run("ip -o link show up 2>/dev/null", check=False)
+    for m in re.finditer(r'^\d+:\s+([^:@\s]+)', r.stdout or "", re.M):
+        i = m.group(1).strip(); low = i.lower()
+        if low.startswith(("tun", "tap", "wg", "nordlynx", "proton", "mullvad", "azwg")):
+            kind = "WireGuard" if low.startswith(("wg", "nordlynx", "proton", "mullvad", "azwg")) else "OpenVPN/tun"
+            return True, kind, i
+    return False, "", ""
+
+
+def network_safety() -> bool:
+    """Deep, user-facing 'am I actually safe?' test — routing, leaks, kill-switch, ISP visibility."""
+    print(f"\n{C.CYAN}{'='*60}\n[*] Network Safety Test\n{'='*60}{C.RESET}\n")
+    detect_backend()
+    safe = True
+
+    if run("systemctl is-active tor-t0rpoiz0n.service", check=False).stdout.strip() != "active":
+        err("Tor service is not active — you are NOT protected. Start it: sudo t0rpoiz0n -s")
+        return False
+
+    # 1. SOCKS path exits via Tor
+    r = run("curl -s --max-time 12 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip", check=False)
+    try:
+        d = json.loads(r.stdout)
+        ok(f"Tor SOCKS path confirmed · exit {d.get('IP','?')}") if d.get("IsTor") else (err("SOCKS path is NOT exiting via Tor"), )
+        if not d.get("IsTor"): safe = False
+    except Exception:
+        warn("Could not reach check.torproject.org over SOCKS"); safe = False
+
+    # 2. Default route (transparent proxy) is captured by Tor — the real leak test
+    r2 = run("curl -s --max-time 12 https://check.torproject.org/api/ip", check=False)
+    try:
+        d2 = json.loads(r2.stdout)
+        if d2.get("IsTor"): ok(f"Default route captured by Tor — no clearnet leak · {d2.get('IP','?')}")
+        else: err(f"LEAK — clearnet traffic exits as {d2.get('IP','?')}; your real IP is exposed"); safe = False
+    except Exception:
+        warn("Could not verify transparent-proxy capture")
+
+    # 3. DNS leak
+    try: resolv = Path("/etc/resolv.conf").read_text()
+    except Exception: resolv = ""
+    if "127.0.0.1" in resolv or "::1" in resolv: ok("DNS resolves locally through Tor — no DNS leak")
+    else: err("DNS may leak — /etc/resolv.conf is not pointed at 127.0.0.1"); safe = False
+
+    # 4. IPv6 leak
+    v6  = run("sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null", check=False).stdout.strip()
+    v6r = run("ip -6 route show default 2>/dev/null", check=False).stdout.strip()
+    if v6 == "1" or not v6r: ok("IPv6 disabled/blocked — no IPv6 leak")
+    else: err("IPv6 has a default route and may leak outside Tor"); safe = False
+
+    # 5. Kill-switch (fail-closed)
+    pol = run(f"{Backend.cmd} -L OUTPUT -n 2>/dev/null | head -1", check=False).stdout
+    if "policy DROP" in pol: ok("Kill-switch active — OUTPUT defaults to DROP (fail-closed if Tor dies)")
+    else: warn("OUTPUT policy is not DROP — a Tor crash could briefly leak traffic")
+
+    # 6. ISP visibility / VPN→Tor posture
+    vpn, kind, iface = detect_vpn()
+    try: bridged = "UseBridges 1" in TORRC.read_text()
+    except Exception: bridged = False
+    print(f"\n{C.CYAN}ISP visibility:{C.RESET}")
+    if vpn:
+        ok(f"VPN tunnel up ({kind} · {iface}) → VPN→Tor: your ISP sees the VPN, not Tor. Ideal.")
+    elif bridged:
+        ok("obfs4 bridge in use → Tor traffic is disguised from your ISP's DPI.")
+    else:
+        warn("No VPN and no bridge — your ISP can SEE that you connect to Tor (not what you do).")
+        print(f"{C.YELLOW}    Tip:{C.RESET} the safe order is VPN → Tor. Connect a trusted VPN FIRST, then")
+        print( "         start t0rpoiz0n: your ISP then only sees encrypted VPN traffic, never Tor.")
+        print( "         (Alternative without a VPN: an obfs4 bridge —  sudo t0rpoiz0n -s -b 'obfs4 ...')")
+
+    # 7. MAC posture
+    ifc = default_interface()
+    if ifc:
+        mac = run(f"cat /sys/class/net/{ifc}/address 2>/dev/null", check=False).stdout.strip()
+        info(f"{ifc} MAC: {mac}  ·  spoof with -m before joining untrusted Wi-Fi")
+
+    print(f"\n{C.CYAN}Browser:{C.RESET} this test can't see WebRTC/canvas fingerprinting — use a hardened")
+    print( "         browser (Tor Browser / the ARXOS browser) for anonymous web sessions.\n")
+
+    if safe:
+        print(f"{C.GREEN}{'='*60}\n[✓] VERDICT: traffic is routed through Tor and sealed — you are SAFE.\n{'='*60}{C.RESET}\n")
+    else:
+        print(f"{C.RED}{'='*60}\n[✗] VERDICT: AT RISK — fix the red items above before trusting this link.\n{'='*60}{C.RESET}\n")
+    return safe
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -707,6 +794,7 @@ def main():
     ap.add_argument('-i', '--interface',   metavar='IFACE',     help='Network interface')
     ap.add_argument('-b', '--bridge',      metavar='BRIDGE',    help='Tor bridge line (obfs4 etc.)')
     ap.add_argument('--pin-guards',        action='store_true', help='Pin entry guards (reduces guard discovery attacks)')
+    ap.add_argument('--safe',              action='store_true', help='Deep network safety + leak test (real IP, DNS, IPv6, VPN→Tor, kill-switch)')
     ap.add_argument('--setup',             action='store_true', help='Re-run first-time setup')
     args = ap.parse_args()
 
@@ -736,6 +824,8 @@ def main():
         sys.exit(0 if new_circuit() else 1)
     elif args.check:
         sys.exit(0 if status() else 1)
+    elif args.safe:
+        sys.exit(0 if network_safety() else 1)
     else:
         ap.print_help()
         print(f"\n{C.CYAN}Examples:{C.RESET}")
@@ -744,6 +834,7 @@ def main():
         print("  sudo t0rpoiz0n -s --pin-guards        # start with guard pinning")
         print("  sudo t0rpoiz0n -s -b 'obfs4 ...'     # start with bridge")
         print("  sudo t0rpoiz0n -c                    # check status")
+        print("  sudo t0rpoiz0n --safe                # full leak + VPN→Tor safety test")
         print("  sudo t0rpoiz0n -r                    # new identity")
         print(f"  sudo t0rpoiz0n -k                    # stop\n")
         print(f"{C.CYAN}Vendors:{C.RESET} {', '.join(sorted(MAC_VENDORS))}\n")
